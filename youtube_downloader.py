@@ -20,7 +20,11 @@ Usage:
     python youtube_downloader.py "https://www.youtube.com/watch?v=..." --audio
     python youtube_downloader.py "https://www.youtube.com/watch?v=..." --video --out "C:\\Videos"
 
+    python youtube_downloader.py "https://www.youtube.com/playlist?list=..." --audio
+
 Audio-only mode saves an MP3 (needs FFmpeg); without FFmpeg it saves M4A.
+Playlists are saved into a subfolder named after the playlist, with files
+numbered in playlist order. Use --single to ignore the playlist part of a link.
 """
 
 import argparse
@@ -28,6 +32,7 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 try:
     import yt_dlp
@@ -55,7 +60,26 @@ def format_duration(seconds) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
+def playlist_kind(url: str) -> str | None:
+    """Classify a URL: 'playlist' (a pure playlist page), 'video_in_playlist'
+    (a video link that also carries a playlist id), or None (single video)."""
+    parsed = urlparse(url)
+    if parsed.path.startswith("/playlist"):
+        return "playlist"
+    if "list" in parse_qs(parsed.query):
+        return "video_in_playlist"
+    return None
+
+
+_announced: set[str] = set()
+
+
 def progress_hook(d: dict) -> None:
+    info = d.get("info_dict") or {}
+    index = info.get("playlist_index")
+    if d["status"] == "downloading" and index and info.get("id") not in _announced:
+        _announced.add(info.get("id"))
+        print(f"\n[{index}/{info.get('n_entries') or '?'}] {info.get('title')}")
     if d["status"] == "downloading":
         percent = d.get("_percent_str", "").strip()
         speed = d.get("_speed_str", "").strip()
@@ -82,7 +106,9 @@ def find_ffmpeg() -> str | None:
     return None
 
 
-def download_video(url: str, output_dir: Path, audio_only: bool = False) -> None:
+def download_video(
+    url: str, output_dir: Path, audio_only: bool = False, playlist: bool = False
+) -> None:
     ffmpeg_dir = find_ffmpeg()
     has_ffmpeg = ffmpeg_dir is not None
 
@@ -103,7 +129,7 @@ def download_video(url: str, output_dir: Path, audio_only: bool = False) -> None
     ydl_opts = {
         "format": fmt,
         "outtmpl": str(output_dir / "%(title)s.%(ext)s"),
-        "noplaylist": True,  # only download the single video, not a whole playlist
+        "noplaylist": not playlist,  # single video unless a playlist was requested
         "progress_hooks": [progress_hook],
         "quiet": True,
         "noprogress": True,  # we print our own progress line
@@ -125,13 +151,16 @@ def download_video(url: str, output_dir: Path, audio_only: bool = False) -> None
     if shutil.which("node") and not shutil.which("deno"):
         ydl_opts["js_runtimes"] = {"node": {}}
 
+    if playlist:
+        download_playlist(url, output_dir, ydl_opts)
+        return
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
-        # noplaylist only applies to watch?v=...&list=... URLs; a pure
-        # playlist URL would still download every video, so reject it.
+        # A pure playlist URL ignores noplaylist; require --playlist for those.
         if info.get("_type") == "playlist":
-            print("  That's a playlist URL - please enter a single video URL.")
+            print("  That's a playlist URL - re-run with --playlist to download it all.")
             return
 
         print(f"\n  Title:    {info.get('title')}")
@@ -144,6 +173,35 @@ def download_video(url: str, output_dir: Path, audio_only: bool = False) -> None
     print(f"\n✔ Saved to: {output_dir}")
 
 
+def download_playlist(url: str, output_dir: Path, ydl_opts: dict) -> None:
+    """Download every video in a playlist into <output_dir>/<playlist title>/."""
+    # Quick listing (no per-video lookups) so we can show what's coming.
+    listing_opts = {k: ydl_opts[k] for k in ("js_runtimes",) if k in ydl_opts}
+    listing_opts.update(extract_flat="in_playlist", quiet=True, no_warnings=True)
+    with yt_dlp.YoutubeDL(listing_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    entries = [e for e in (info.get("entries") or []) if e]
+    if not entries:
+        print("  No videos found in that playlist (is it private or empty?).")
+        return
+    print(f"\n  Playlist: {info.get('title')}")
+    print(f"  Videos:   {len(entries)}")
+
+    opts = dict(ydl_opts)
+    opts["noplaylist"] = False
+    opts["ignoreerrors"] = True  # skip private/deleted videos instead of stopping
+    opts["outtmpl"] = str(
+        output_dir / "%(playlist_title)s" / "%(playlist_index)03d - %(title)s.%(ext)s"
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        had_errors = ydl.download([url])
+
+    print(f"\n✔ Saved to: {output_dir / (info.get('title') or '')}")
+    if had_errors:
+        print("  Note: some videos were skipped (private, deleted or unavailable).")
+
+
 def main() -> None:
     print("=== YouTube Video Downloader ===\n")
 
@@ -154,6 +212,11 @@ def main() -> None:
         mode.add_argument("--audio", action="store_true", help="download audio only (MP3)")
         mode.add_argument("--video", action="store_true", help="download video (skip the prompt)")
         parser.add_argument("--out", help="folder to save into (skip the prompt)")
+        scope = parser.add_mutually_exclusive_group()
+        scope.add_argument("--playlist", action="store_true",
+                           help="download every video in the playlist")
+        scope.add_argument("--single", action="store_true",
+                           help="download only the one video, even if the link has a playlist")
         opts = parser.parse_args()
         audio_flag = opts.audio
 
@@ -164,6 +227,21 @@ def main() -> None:
         if not is_youtube_url(url):
             print("That doesn't look like a YouTube URL.")
             return
+
+        kind = playlist_kind(url)
+        if opts.playlist:
+            playlist = True
+        elif kind == "playlist":
+            if opts.single:
+                print("That link is a playlist, not a single video; drop --single.")
+                return
+            playlist = True
+        elif kind == "video_in_playlist" and not opts.single:
+            choice = input("This video is part of a playlist. Download only "
+                           "[t]his video or the [w]hole playlist? [t]: ").strip().lower()
+            playlist = choice.startswith("w")
+        else:
+            playlist = False
 
         if audio_flag or opts.video:
             audio_only = audio_flag
@@ -176,7 +254,7 @@ def main() -> None:
         output_dir = Path(folder).expanduser() if folder else default_dir
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        download_video(url, output_dir, audio_only)
+        download_video(url, output_dir, audio_only, playlist)
     except yt_dlp.utils.DownloadError as e:
         print(f"\n✘ Download failed: {e}")
         if "format is not available" in str(e) and not find_ffmpeg():
